@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Regen Bus Pumping</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<main>
+<nav class="back"><a href="../README.md">← Learning index</a> · module <a href="../07_Power_Input_and_Protection.md">07</a></nav>
+<h1>Regenerative braking pumps up the bus voltage</h1>
+<p class="lead">The motor spins a load, then brakes to zero in a set time. The kinetic energy (½·J·ω²)
+comes back into the DC bus. Where can it go? Choose the supply/protection and watch the bus voltage
+versus the 60 V MOSFET rating.</p>
+
+<div class="grid">
+  <div class="panel">
+    <div class="ctrl"><label>Supply / protection</label>
+      <select id="mode">
+        <option value="psu">Lab PSU only (cannot sink current)</option>
+        <option value="bat">Battery (absorbs, 0.1 Ω internal R)</option>
+        <option value="tvs">Lab PSU + TVS (breakdown 33 V)</option>
+        <option value="chop">Lab PSU + brake chopper (30 V, 3 Ω)</option>
+        <option value="fw">Lab PSU + firmware regen limit (reduce braking above 28 V)</option>
+      </select></div>
+    <div class="ctrl"><label>Inertia at motor (rotor + reflected load) <span id="j_v"></span></label><input id="j" type="range" min="0.5" max="40" step="0.5" value="6"></div>
+    <div class="ctrl"><label>Start speed (motor) <span id="w_v"></span></label><input id="w" type="range" min="100" max="3000" step="50" value="1500"></div>
+    <div class="ctrl"><label>Braking time <span id="td_v"></span></label><input id="td" type="range" min="5" max="500" step="5" value="50"></div>
+    <div class="ctrl"><label>Bus capacitance <span id="c_v"></span></label><input id="c" type="range" min="20" max="2000" step="10" value="100"></div>
+    <div class="ctrl"><label>Supply voltage <span id="vs_v"></span></label><input id="vs" type="range" min="12" max="48" step="1" value="24"></div>
+    <p class="note">Assumes 80 % of the kinetic energy reaches the bus (rest lost in windings/FETs) and 0.1 A logic load.
+    Note how a bigger capacitor only helps a little - energy grows with V², so you need a lot of µF.
+    TVS energy above ~1 J (SMCJ class) for long pulses = a dead TVS.</p>
+  </div>
+  <div class="panel">
+    <canvas id="cv"></canvas>
+    <canvas id="cp" style="margin-top:8px"></canvas>
+    <div class="readout">
+      <div><small>Kinetic energy</small><b id="o_e"></b></div>
+      <div><small>Peak regen power</small><b id="o_p"></b></div>
+      <div><small>Peak bus voltage</small><b id="o_v"></b></div>
+      <div><small>Energy into TVS / resistor</small><b id="o_d"></b></div>
+      <div><small>Actual stop time</small><b id="o_t"></b></div>
+    </div>
+  </div>
+</div>
+</main>
+<script src="common.js"></script>
+<script>
+const g = {
+  j: bindSlider("j", v => v + " kg·cm²", () => redraw()),
+  w: bindSlider("w", v => v + " rpm", () => redraw()),
+  td: bindSlider("td", v => v + " ms", () => redraw()),
+  c: bindSlider("c", v => v + " µF", () => redraw()),
+  vs: bindSlider("vs", v => v + " V", () => redraw()),
+};
+const modeEl = document.getElementById("mode");
+modeEl.addEventListener("change", () => redraw());
+window.redraw = function () {
+  const J = g.j() * 1e-4, w0 = g.w() * 2 * Math.PI / 60, Td = g.td() * 1e-3, C = g.c() * 1e-6, Vs = g.vs();
+  const mode = modeEl.value, EFF = 0.8, ILOG = 0.1;
+  const alpha = w0 / Td;                      // commanded deceleration
+  const tEnd = Math.max(Td * 2, 0.02), dt = Math.min(5e-6, tEnd / 40000);
+  let V = Vs, w = w0, t = 0, Ediss = 0, Vpk = V, Ppk = 0, tStop = null;
+  const ts = [], vs = [], ps = [];
+  let nextLog = 0;
+  while (t < tEnd) {
+    let a = w > 0 ? alpha : 0;
+    if (mode === "fw" && V > 28) a *= Math.max(0, 1 - (V - 28) / 2);  // firmware backs off braking
+    const Pm = J * w * a * EFF;               // power returned to the bus
+    // Bus node: C·dV/dt = I_src + Σ G·(Vref - V). Solved implicitly (stable with tiny R·C).
+    const iSrc = Pm / Math.max(V, 1) - ILOG;
+    let G = 0, GV = 0, Gd = 0, GVd = 0;        // all conductances / only the dissipating ones
+    if (mode === "bat") { G += 10; GV += 10 * Vs; }
+    else if (V < Vs) { G += 20; GV += 20 * Vs; }        // PSU can source but not sink
+    if (mode === "tvs" && V > 33) { Gd = 1 / 0.3; GVd = 33 / 0.3; }
+    if (mode === "chop" && V > 30) { Gd = 1 / 3; GVd = 0; }
+    V = Math.max(0, (C / dt * V + iSrc + GV + GVd) / (C / dt + G + Gd));
+    Ediss += V * Math.max(0, Gd * V - GVd) * dt;
+    if (V > 150) V = 150;                     // plot cap ("it's dead by now")
+    w = Math.max(0, w - a * dt);
+    if (w === 0 && tStop === null) tStop = t;
+    Vpk = Math.max(Vpk, V); Ppk = Math.max(Ppk, Pm);
+    if (t >= nextLog) { ts.push(t * 1e3); vs.push(V); ps.push(Pm); nextLog += tEnd / 600; }
+    t += dt;
+  }
+  plot(document.getElementById("cv"), {
+    height: 240, xlabel: "time (ms)", ylabel: "bus volts", ymin: 0, ymax: Math.max(70, Math.min(150, Vpk * 1.1)),
+    series: [{ x: ts, y: vs, color: "--c1", label: "bus voltage" }],
+    hlines: [{ y: 60, color: "--bad", label: "60 V FET rating" }, { y: Vs, color: "--muted", label: "supply" }]
+  });
+  plot(document.getElementById("cp"), {
+    height: 160, xlabel: "time (ms)", ylabel: "watts", ymin: 0,
+    series: [{ x: ts, y: ps, color: "--c3", label: "regen power into bus" }]
+  });
+  const set = (id, t, cls) => { const e = document.getElementById(id); e.textContent = t; e.className = cls || ""; };
+  set("o_e", eng(0.5 * J * w0 * w0, "J"));
+  set("o_p", eng(Ppk, "W"));
+  set("o_v", Vpk >= 150 ? "> 150 V 💥" : eng(Vpk, "V"), Vpk > 60 ? "bad" : Vpk > 45 ? "" : "good");
+  set("o_d", eng(Ediss, "J"), mode === "tvs" && Ediss > 1 ? "bad" : "");
+  set("o_t", tStop === null ? "not stopped" : eng(tStop, "s"));
+};
+redraw();
+</script>
+</body>
+</html>

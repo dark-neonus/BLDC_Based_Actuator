@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FOC Vector View</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<main>
+<nav class="back"><a href="../README.md">← Learning index</a> · module <a href="../02_BLDC_Motor_and_FOC.md">02</a></nav>
+<h1>FOC: three currents → one rotating vector → two DC numbers</h1>
+<p class="lead">Left: the stator's three phase axes (a, b, c), each phase current as an arrow, and their
+sum (the current vector, white/black). The rotor magnet direction is the d-axis; torque comes from the
+current component perpendicular to it (q). Right: the same thing over time - the AC phase currents
+and the Id/Iq that the controller "sees" after Clarke + Park.</p>
+
+<div class="grid">
+  <div class="panel">
+    <div class="ctrl"><label>Rotor speed (electrical) <span id="sp_v"></span></label><input id="sp" type="range" min="0" max="3" step="0.05" value="0.6"></div>
+    <div class="ctrl"><label>Commanded Iq (torque) <span id="iq_v"></span></label><input id="iq" type="range" min="-10" max="10" step="0.5" value="6"></div>
+    <div class="ctrl"><label>Commanded Id <span id="id_v"></span></label><input id="id" type="range" min="-10" max="10" step="0.5" value="0"></div>
+    <div class="ctrl"><label>Encoder angle error (electrical) <span id="er_v"></span></label><input id="er" type="range" min="-90" max="90" step="1" value="0"></div>
+    <div class="ctrl"><label>Drive mode
+      </label><select id="mode"><option value="foc">FOC (sinusoidal currents)</option><option value="six">Six-step (block currents)</option></select></div>
+    <p class="note">Try: encoder error 30° → the controller thinks it puts all current into q, but real torque drops
+    (cos 30° = 87 %) and real Id appears. At 90° → zero torque, all heat. With 21 pole pairs, 30° electrical is only 1.4° mechanical!
+    Try six-step → torque (Iq) ripples every 60°.</p>
+  </div>
+  <div class="panel">
+    <div style="display:grid;grid-template-columns:minmax(220px,1fr) 2fr;gap:10px">
+      <canvas id="cvec"></canvas>
+      <div><canvas id="cabc"></canvas><canvas id="cdq" style="margin-top:6px"></canvas></div>
+    </div>
+    <div class="readout">
+      <div><small>True torque current Iq</small><b id="o_iq"></b></div>
+      <div><small>True Id (wasted)</small><b id="o_id"></b></div>
+      <div><small>Torque vs. ideal</small><b id="o_tq"></b></div>
+    </div>
+  </div>
+</div>
+</main>
+<script src="common.js"></script>
+<script>
+const g = {
+  sp: bindSlider("sp", v => v.toFixed(2) + " rev/s (slow-mo)", () => {}),
+  iq: bindSlider("iq", v => v + " A", () => {}),
+  id: bindSlider("id", v => v + " A", () => {}),
+  er: bindSlider("er", v => v + "°", () => {}),
+};
+const modeEl = document.getElementById("mode");
+let theta = 0, last = performance.now();
+const hist = { t: [], a: [], b: [], c: [], d: [], q: [] };
+let tsim = 0;
+
+function phaseCurrents(thEst) {
+  // Controller applies current vector at angle (thEst + atan2(iq,id)) in stationary frame.
+  const Iq = g.iq(), Id = g.id();
+  if (modeEl.value === "foc") {
+    const al = Id * Math.cos(thEst) - Iq * Math.sin(thEst);
+    const be = Id * Math.sin(thEst) + Iq * Math.cos(thEst);
+    return [al, -al / 2 + be * Math.sqrt(3) / 2, -al / 2 - be * Math.sqrt(3) / 2];
+  }
+  // six-step: two phases conduct (+I, -I), the third floats. Only 6 possible vector
+  // directions (-30°, 30°, 90°, ...); pick the one closest to the desired angle.
+  const mag = Math.hypot(Iq, Id);
+  const ang = thEst + Math.atan2(Iq, Id);
+  const pats = [[1, -1, 0], [1, 0, -1], [0, 1, -1], [-1, 1, 0], [-1, 0, 1], [0, -1, 1]];
+  const idx = ((Math.round((ang + Math.PI / 6) / (Math.PI / 3)) % 6) + 6) % 6;
+  const I = mag / (2 / Math.sqrt(3));      // each pattern's vector length is 2/√3 × I
+  return pats[idx].map(v => v * I);
+}
+function dq(ia, ib, ic, th) {
+  const al = (2 / 3) * (ia - 0.5 * ib - 0.5 * ic);
+  const be = (2 / 3) * (Math.sqrt(3) / 2) * (ib - ic);
+  return [al * Math.cos(th) + be * Math.sin(th), -al * Math.sin(th) + be * Math.cos(th)];
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  theta = (theta + 2 * Math.PI * g.sp() * dt) % (2 * Math.PI);
+  tsim += dt;
+  const err = g.er() * Math.PI / 180;
+  const [ia, ib, ic] = phaseCurrents(theta + err);
+  const [Id, Iq] = dq(ia, ib, ic, theta);           // TRUE values (true rotor angle)
+  hist.t.push(tsim); hist.a.push(ia); hist.b.push(ib); hist.c.push(ic); hist.d.push(Id); hist.q.push(Iq);
+  while (hist.t.length && hist.t[0] < tsim - 4) Object.values(hist).forEach(a => a.shift());
+
+  drawVectors(ia, ib, ic, Id, Iq);
+  const lim = 12;
+  plot(document.getElementById("cabc"), { height: 150, xlabel: "", ylabel: "A", xmin: tsim - 4, xmax: tsim, ymin: -lim, ymax: lim,
+    series: [{ x: hist.t, y: hist.a, color: "--c1", label: "Ia" }, { x: hist.t, y: hist.b, color: "--c2", label: "Ib" }, { x: hist.t, y: hist.c, color: "--c3", label: "Ic" }] });
+  plot(document.getElementById("cdq"), { height: 150, xlabel: "time (s)", ylabel: "A", xmin: tsim - 4, xmax: tsim, ymin: -lim, ymax: lim,
+    series: [{ x: hist.t, y: hist.q, color: "--c5", label: "true Iq (torque)" }, { x: hist.t, y: hist.d, color: "--c4", label: "true Id" }] });
+  const ideal = g.iq();
+  document.getElementById("o_iq").textContent = Iq.toFixed(2) + " A";
+  document.getElementById("o_id").textContent = Id.toFixed(2) + " A";
+  document.getElementById("o_tq").textContent = ideal ? (100 * Iq / ideal).toFixed(0) + " %" : "—";
+  requestAnimationFrame(frame);
+}
+
+function arrow(ctx, x0, y0, x1, y1, color, w) {
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = w || 2;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  const a = Math.atan2(y1 - y0, x1 - x0), L = Math.hypot(x1 - x0, y1 - y0);
+  if (L < 4) return;
+  ctx.beginPath(); ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - 9 * Math.cos(a - 0.4), y1 - 9 * Math.sin(a - 0.4));
+  ctx.lineTo(x1 - 9 * Math.cos(a + 0.4), y1 - 9 * Math.sin(a + 0.4)); ctx.fill();
+}
+function drawVectors(ia, ib, ic, Id, Iq) {
+  const cv = document.getElementById("cvec");
+  const { ctx, w, h } = setupCanvas(cv, 310);
+  ctx.fillStyle = css("--panel"); ctx.fillRect(0, 0, w, h);
+  const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 20, s = R / 12;
+  ctx.strokeStyle = css("--grid"); ctx.beginPath(); ctx.arc(cx, cy, R, 0, 2 * Math.PI); ctx.stroke();
+  const axes = [0, 2 * Math.PI / 3, 4 * Math.PI / 3], cols = ["--c1", "--c2", "--c3"], cur = [ia, ib, ic], names = ["a", "b", "c"];
+  ctx.font = "12px system-ui"; ctx.textAlign = "center";
+  axes.forEach((ang, i) => {
+    ctx.strokeStyle = css("--border"); ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(cx - R * Math.cos(ang), cy + R * Math.sin(ang)); ctx.lineTo(cx + R * Math.cos(ang), cy - R * Math.sin(ang)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = css(cols[i]); ctx.fillText(names[i], cx + (R + 10) * Math.cos(ang), cy - (R + 10) * Math.sin(ang) + 4);
+  });
+  // phase current arrows chained tip-to-tail -> sum (×1.5 = amplitude-invariant resultant)
+  let x = cx, y = cy;
+  axes.forEach((ang, i) => {
+    const nx = x + cur[i] * s * Math.cos(ang), ny = y - cur[i] * s * Math.sin(ang);
+    arrow(ctx, x, y, nx, ny, css(cols[i]), 2); x = nx; y = ny;
+  });
+  // rotor d and q axes
+  const dx = Math.cos(theta), dy = Math.sin(theta);
+  arrow(ctx, cx, cy, cx + R * 0.95 * dx, cy - R * 0.95 * dy, css("--c4"), 4);
+  ctx.fillStyle = css("--c4"); ctx.fillText("d (magnet N)", cx + R * 0.7 * dx, cy - R * 0.7 * dy - 8);
+  ctx.strokeStyle = css("--c5"); ctx.setLineDash([6, 4]); ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx - R * dy, cy - R * dx); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = css("--c5"); ctx.fillText("q", cx - R * 0.9 * dy, cy - R * 0.9 * dx);
+  // resultant vector (2/3 of chained sum = Clarke amplitude)
+  const vx = (x - cx) * 2 / 3, vy = (y - cy) * 2 / 3;
+  arrow(ctx, cx, cy, cx + vx, cy + vy, css("--text"), 3);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

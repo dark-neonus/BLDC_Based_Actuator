@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shunt Sizing Lab</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<main>
+<nav class="back"><a href="../README.md">← Learning index</a> · module <a href="../05_Current_Sensing.md">05</a></nav>
+<h1>Current sensing chain: shunt → amplifier → ADC</h1>
+<p class="lead">Pick a shunt, amplifier gain and ADC. The plot shows a sinusoidal phase current, what the ADC
+actually reads (with quantisation, noise and offset), and where it clips. The readouts show heat, range
+and resolution - the trade-offs from module 05.</p>
+
+<div class="grid">
+  <div class="panel">
+    <div class="ctrl"><label>Phase current amplitude <span id="ia_v"></span></label><input id="ia" type="range" min="1" max="60" step="1" value="25"></div>
+    <div class="ctrl"><label>Shunt resistance <span id="rs_v"></span></label><input id="rs" type="range" min="0.25" max="5" step="0.25" value="1"></div>
+    <div class="ctrl"><label>Amplifier gain <span id="gn_v"></span></label><input id="gn" type="range" min="5" max="100" step="5" value="40"></div>
+    <div class="ctrl"><label>ADC bits (nominal) <span id="nb_v"></span></label><input id="nb" type="range" min="8" max="16" step="1" value="12"></div>
+    <div class="ctrl"><label>ADC + amp noise (RMS) <span id="nz_v"></span></label><input id="nz" type="range" min="0" max="10" step="0.25" value="2"></div>
+    <div class="ctrl"><label>Amplifier offset (input-referred) <span id="of_v"></span></label><input id="of" type="range" min="-500" max="500" step="10" value="150"></div>
+    <div class="ctrl"><label><input id="cal" type="checkbox" checked style="width:auto"> Offset calibrated at startup</label></div>
+    <p class="note">ADC: 3.3 V range, bias at 1.65 V (bidirectional). Noise ≈ 2 mV RMS is a realistic
+    ESP32-S3 internal-ADC figure; a good external ADC is ~0.2 mV. Try: 0.5 mΩ + gain 20 vs 2 mΩ + gain 20 - look at
+    resolution <i>and</i> shunt power.</p>
+  </div>
+  <div class="panel">
+    <canvas id="c"></canvas>
+    <div class="readout">
+      <div><small>Shunt voltage at peak</small><b id="o_vs"></b></div>
+      <div><small>Shunt power (sine RMS)</small><b id="o_p"></b></div>
+      <div><small>Full-scale current (±)</small><b id="o_fs"></b></div>
+      <div><small>1 LSB =</small><b id="o_lsb"></b></div>
+      <div><small>Noise-limited resolution (RMS)</small><b id="o_nr"></b></div>
+      <div><small>Offset error (uncal.)</small><b id="o_oe"></b></div>
+    </div>
+  </div>
+</div>
+</main>
+<script src="common.js"></script>
+<script>
+const g = {
+  ia: bindSlider("ia", v => v + " A", () => redraw()),
+  rs: bindSlider("rs", v => v + " mΩ", () => redraw()),
+  gn: bindSlider("gn", v => "× " + v, () => redraw()),
+  nb: bindSlider("nb", v => v + " bit", () => redraw()),
+  nz: bindSlider("nz", v => v + " mV", () => redraw()),
+  of: bindSlider("of", v => v + " µV", () => redraw()),
+};
+document.getElementById("cal").addEventListener("change", () => redraw());
+// deterministic pseudo-random so the plot doesn't flicker
+function rng(seed) { let s = seed; return () => { s = (s * 1664525 + 1013904223) % 4294967296; return s / 4294967296; }; }
+window.redraw = function () {
+  const A = g.ia(), R = g.rs() * 1e-3, G = g.gn(), bits = g.nb(), noise = g.nz() * 1e-3, off = g.of() * 1e-6;
+  const cal = document.getElementById("cal").checked;
+  const VFS = 3.3, VB = 1.65, lsb = VFS / Math.pow(2, bits);
+  const ampPerVolt = 1 / (R * G);
+  const r = rng(7), gauss = () => { let u = 0; for (let i = 0; i < 6; i++) u += r(); return (u - 3) / Math.SQRT1_2; };  // sum of 6 uniforms: var 0.5 -> scale to 1
+  const N = 400, ts = [], tru = [], meas = [];
+  let clip = false;
+  for (let k = 0; k < N; k++) {
+    const t = k / N * 2;                         // 2 electrical cycles
+    const i = A * Math.sin(2 * Math.PI * t);
+    let v = VB + (i * R + off) * G + noise * gauss();
+    if (v < 0 || v > VFS) clip = true;
+    v = Math.min(VFS - lsb, Math.max(0, v));
+    const code = Math.floor(v / lsb);
+    const vRead = code * lsb + lsb / 2;
+    const offCorr = cal ? off * G : 0;
+    ts.push(t); tru.push(i); meas.push((vRead - VB - offCorr) * ampPerVolt);
+  }
+  const fs = VB / G / R;
+  plot(document.getElementById("c"), {
+    height: 300, xlabel: "electrical cycles", ylabel: "amps",
+    series: [{ x: ts, y: meas, color: "--c1", label: "measured", width: 1.5 },
+             { x: ts, y: tru, color: "--c3", label: "true current", width: 2, dash: [6, 4] }],
+    hlines: [{ y: fs, color: "--bad", label: "ADC clips" }, { y: -fs, color: "--bad" }]
+  });
+  const set = (id, t, cls) => { const e = document.getElementById(id); e.textContent = t; e.className = cls || ""; };
+  set("o_vs", eng(A * R, "V"));
+  const p = (A / Math.SQRT2) ** 2 * R;
+  set("o_p", eng(p, "W"), p > 1.5 ? "bad" : "");
+  set("o_fs", eng(fs, "A") + (clip ? " - CLIPPING" : ""), clip ? "bad" : "good");
+  set("o_lsb", eng(lsb * ampPerVolt, "A"));
+  set("o_nr", eng(Math.hypot(noise, lsb / Math.sqrt(12)) * ampPerVolt, "A"));
+  set("o_oe", eng(off * G * ampPerVolt, "A"));
+};
+redraw();
+</script>
+</body>
+</html>

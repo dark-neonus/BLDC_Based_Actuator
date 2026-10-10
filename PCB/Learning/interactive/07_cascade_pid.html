@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cascade PID Tuning</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<main>
+<nav class="back"><a href="../README.md">← Learning index</a> · module <a href="../02_BLDC_Motor_and_FOC.md">02</a></nav>
+<h1>Cascaded position → velocity → torque control</h1>
+<p class="lead">Position P-loop feeds a velocity PI-loop, which commands torque (the FOC current loop, modelled
+as a fast first-order lag with a torque limit). The joint gets a position step at t = 0.1 s and a load
+torque kick at t = 0.6 s. Velocity is computed from a quantised, noisy encoder - see how encoder
+quality limits how stiff you can tune.</p>
+
+<div class="grid">
+  <div class="panel">
+    <div class="ctrl"><label>Position Kp <span id="kp_v"></span></label><input id="kp" type="range" min="1" max="200" step="1" value="40"></div>
+    <div class="ctrl"><label>Velocity Kv (Nm per rad/s) <span id="kv_v"></span></label><input id="kv" type="range" min="0.001" max="0.3" step="0.001" value="0.1"></div>
+    <div class="ctrl"><label>Velocity Ki <span id="ki_v"></span></label><input id="ki" type="range" min="0" max="5" step="0.05" value="0.6"></div>
+    <div class="ctrl"><label>Velocity filter cutoff <span id="fc_v"></span></label><input id="fc" type="range" min="20" max="3000" step="10" value="300"></div>
+    <div class="ctrl"><label>Encoder resolution <span id="bits_v"></span></label><input id="bits" type="range" min="8" max="21" step="1" value="14"></div>
+    <div class="ctrl"><label>Encoder noise (RMS) <span id="en_v"></span></label><input id="en" type="range" min="0" max="0.2" step="0.005" value="0.02"></div>
+    <div class="ctrl"><label>Inertia (rotor + reflected) <span id="j_v"></span></label><input id="j" type="range" min="0.5" max="40" step="0.5" value="5"></div>
+    <div class="ctrl"><label>Current-loop bandwidth <span id="cb_v"></span></label><input id="cb" type="range" min="100" max="3000" step="50" value="1000"></div>
+    <button id="rerun">Run again</button>
+    <p class="note">Torque limit 2 N·m (motor side), loop rate 10 kHz. Try: encoder 10 bit → torque command becomes
+    a noisy mess unless you lower the filter cutoff, which then forces lower gains. Try: Ki = 0 → the load kick
+    leaves a permanent position error.</p>
+  </div>
+  <div class="panel">
+    <canvas id="cpos"></canvas>
+    <canvas id="ctq" style="margin-top:8px"></canvas>
+    <div class="readout">
+      <div><small>Overshoot</small><b id="o_os"></b></div>
+      <div><small>Settling time (2 %)</small><b id="o_st"></b></div>
+      <div><small>Error after load kick (end)</small><b id="o_ss"></b></div>
+      <div><small>Torque noise at rest (RMS)</small><b id="o_tn"></b></div>
+    </div>
+  </div>
+</div>
+</main>
+<script src="common.js"></script>
+<script>
+const g = {
+  kp: bindSlider("kp", v => v + " 1/s", () => redraw()),
+  kv: bindSlider("kv", v => v.toFixed(3), () => redraw()),
+  ki: bindSlider("ki", v => v.toFixed(2), () => redraw()),
+  fc: bindSlider("fc", v => v + " Hz", () => redraw()),
+  bits: bindSlider("bits", v => v + " bit (" + (360 / 2 ** v).toPrecision(2) + "°)", () => redraw()),
+  en: bindSlider("en", v => v.toFixed(3) + "°", () => redraw()),
+  j: bindSlider("j", v => v + " kg·cm²", () => redraw()),
+  cb: bindSlider("cb", v => v + " Hz", () => redraw()),
+};
+let seed = 1;
+document.getElementById("rerun").addEventListener("click", () => { seed++; redraw(); });
+function rng(s) { return () => { s = (s * 1664525 + 1013904223) % 4294967296; return s / 4294967296; }; }
+
+window.redraw = function () {
+  const Kp = g.kp(), Kv = g.kv(), Ki = g.ki(), fc = g.fc(), bits = g.bits(), en = g.en() * Math.PI / 180;
+  const J = g.j() * 1e-4, wc = 2 * Math.PI * g.cb(), B = 0.0005, TMAX = 2;
+  const dt = 1e-4, T = 1.0, q = 2 * Math.PI / 2 ** bits;
+  const r = rng(seed * 97 + 3), gauss = () => { let u = 0; for (let i = 0; i < 6; i++) u += r(); return (u - 3) / Math.SQRT1_2; };
+  const aF = 1 - Math.exp(-2 * Math.PI * fc * dt);
+  let th = 0, w = 0, tq = 0, integ = 0, thMeasPrev = 0, wf = 0;
+  const STEP = 1.0;     // rad (motor side) position step
+  const ts = [], ref = [], pos = [], tcmd = [];
+  let peak = 0, settle = null, tnSum = 0, tnN = 0, endErr = 0;
+  const N = Math.round(T / dt);
+  for (let k = 0; k < N; k++) {
+    const t = k * dt;
+    const thRef = t >= 0.1 ? STEP : 0;
+    const tload = t >= 0.6 ? 0.4 : 0;
+    // encoder: quantise + noise
+    const thMeas = Math.floor((th + en * gauss()) / q) * q;
+    const wRaw = (thMeas - thMeasPrev) / dt; thMeasPrev = thMeas;
+    wf += aF * (wRaw - wf);
+    // controllers
+    const wRef = Kp * (thRef - thMeas);
+    const ev = wRef - wf;
+    let tc = Kv * ev + integ;
+    integ += Ki * ev * dt;
+    integ = Math.max(-TMAX, Math.min(TMAX, integ));          // anti-windup clamp
+    tc = Math.max(-TMAX, Math.min(TMAX, tc));
+    // current loop ~ first-order lag
+    tq += (tc - tq) * (1 - Math.exp(-wc * dt));
+    // plant
+    const acc = (tq - tload - B * w) / J;
+    w += acc * dt; th += w * dt;
+    if (k % 5 === 0) { ts.push(t); ref.push(thRef); pos.push(th); tcmd.push(tc); }
+    if (t > 0.1 && t < 0.6) peak = Math.max(peak, th);
+    if (t > 0.45 && t < 0.6) { tnSum += tc * tc; tnN++; }
+    if (t > 0.98) endErr = thRef - th;
+  }
+  // settling: last time outside ±2 % before 0.6 s
+  for (let i = 0; i < ts.length; i++) {
+    if (ts[i] > 0.1 && ts[i] < 0.6 && Math.abs(pos[i] - STEP) > 0.02 * STEP) settle = ts[i] - 0.1;
+  }
+  plot(document.getElementById("cpos"), {
+    height: 230, xlabel: "time (s)", ylabel: "motor angle (rad)",
+    series: [{ x: ts, y: ref, color: "--muted", label: "reference", dash: [6, 4] }, { x: ts, y: pos, color: "--c3", label: "position" }]
+  });
+  plot(document.getElementById("ctq"), {
+    height: 180, xlabel: "time (s)", ylabel: "torque cmd (N·m)", ymin: -TMAX * 1.1, ymax: TMAX * 1.1,
+    series: [{ x: ts, y: tcmd, color: "--c1", label: "torque command", width: 1 }]
+  });
+  const set = (id, t, cls) => { const e = document.getElementById(id); e.textContent = t; e.className = cls || ""; };
+  const os = Math.max(0, (peak - STEP) / STEP * 100);
+  set("o_os", os.toFixed(1) + " %", os > 20 ? "bad" : "");
+  set("o_st", settle === null ? "< 1 ms" : (settle >= 0.49 ? "not settled" : eng(settle, "s")), settle >= 0.49 ? "bad" : "");
+  set("o_ss", eng(endErr * 180 / Math.PI, "°"));
+  const tn = Math.sqrt(tnSum / Math.max(1, tnN));
+  set("o_tn", eng(tn, "N·m"), tn > 0.2 ? "bad" : "");
+};
+redraw();
+</script>
+</body>
+</html>

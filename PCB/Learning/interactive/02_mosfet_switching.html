@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MOSFET Switching</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<main>
+<nav class="back"><a href="../README.md">← Learning index</a> · module <a href="../03_MOSFETs_and_Half_Bridge.md">03</a></nav>
+<h1>MOSFET switching: gate charge, Miller plateau, losses, ringing</h1>
+<p class="lead">A simplified (piecewise) model of one MOSFET in a half-bridge switching an inductive
+load current. Top: turn-on. Bottom: turn-off with the stray loop inductance making an overshoot.
+Shaded areas = where voltage and current overlap = switching loss.</p>
+
+<div class="grid">
+  <div class="panel">
+    <div class="ctrl"><label>Gate resistor Rg (external) <span id="rg_v"></span></label><input id="rg" type="range" min="0" max="40" step="0.5" value="5"></div>
+    <div class="ctrl"><label>Gate drive voltage <span id="vdrv_v"></span></label><input id="vdrv" type="range" min="5" max="15" step="0.5" value="12"></div>
+    <div class="ctrl"><label>Miller charge Qgd <span id="qgd_v"></span></label><input id="qgd" type="range" min="2" max="40" step="1" value="10"></div>
+    <div class="ctrl"><label>Input capacitance Ciss <span id="ciss_v"></span></label><input id="ciss" type="range" min="1" max="12" step="0.5" value="4"></div>
+    <div class="ctrl"><label>Load current <span id="iload_v"></span></label><input id="iload" type="range" min="1" max="60" step="1" value="20"></div>
+    <div class="ctrl"><label>Bus voltage <span id="vbus_v"></span></label><input id="vbus" type="range" min="6" max="48" step="1" value="24"></div>
+    <div class="ctrl"><label>Stray loop inductance <span id="lloop_v"></span></label><input id="lloop" type="range" min="1" max="40" step="1" value="8"></div>
+    <div class="ctrl"><label>PWM frequency <span id="fpwm_v"></span></label><input id="fpwm" type="range" min="5" max="100" step="5" value="20"></div>
+    <p class="note">Fixed: Vth = 3 V, plateau = 4.5 V, internal gate R = 1 Ω, Coss = 1.5 nF, loop damping ≈ 0.4 Ω.
+    Try: Rg 1 Ω → fast, low loss, but big overshoot. Rg 30 Ω → slow, hot, quiet. Then increase the loop inductance
+    and see why <b>layout</b> beats any gate resistor.</p>
+  </div>
+  <div class="panel">
+    <canvas id="c_on"></canvas>
+    <canvas id="c_off" style="margin-top:8px"></canvas>
+    <div class="readout">
+      <div><small>Plateau (Miller) time</small><b id="o_tpl"></b></div>
+      <div><small>Turn-on loss energy</small><b id="o_eon"></b></div>
+      <div><small>Turn-off loss energy</small><b id="o_eoff"></b></div>
+      <div><small>Switching loss @ f</small><b id="o_psw"></b></div>
+      <div><small>Turn-off peak V_DS</small><b id="o_vpk"></b></div>
+      <div><small>Ringing frequency</small><b id="o_fr"></b></div>
+    </div>
+  </div>
+</div>
+</main>
+<script src="common.js"></script>
+<script>
+const g = {
+  rg: bindSlider("rg", v => v + " Ω", () => redraw()),
+  vdrv: bindSlider("vdrv", v => v + " V", () => redraw()),
+  qgd: bindSlider("qgd", v => v + " nC", () => redraw()),
+  ciss: bindSlider("ciss", v => v + " nF", () => redraw()),
+  i: bindSlider("iload", v => v + " A", () => redraw()),
+  vbus: bindSlider("vbus", v => v + " V", () => redraw()),
+  l: bindSlider("lloop", v => v + " nH", () => redraw()),
+  f: bindSlider("fpwm", v => v + " kHz", () => redraw()),
+};
+const VTH = 3, VPL = 4.5, RGI = 1, COSS = 1.5e-9, RDAMP = 0.4;
+
+window.redraw = function () {
+  const Rg = g.rg() + RGI, Vd = g.vdrv(), Qgd = g.qgd() * 1e-9, C = g.ciss() * 1e-9;
+  const I = g.i(), V = g.vbus(), L = g.l() * 1e-9, f = g.f() * 1e3;
+  const tau = Rg * C;
+  const plOK = Vd > VPL + 0.3;
+
+  // ---------- TURN-ON ----------
+  const t1 = -tau * Math.log(1 - VTH / Vd);                    // delay to Vth
+  const t2 = tau * Math.log((Vd - VTH) / (Vd - VPL));          // current rise
+  const Ig = (Vd - VPL) / Rg;                                  // plateau gate current
+  const t3 = Qgd / Ig;                                         // voltage fall (Miller)
+  const tEnd = t1 + t2 + t3 + 4 * tau;
+  const N = 600, on = { t: [], vgs: [], vds: [], id: [] };
+  for (let k = 0; k <= N; k++) {
+    const t = k / N * tEnd; let vgs, vds, id;
+    if (t < t1) { vgs = Vd * (1 - Math.exp(-t / tau)); vds = V; id = 0; }
+    else if (t < t1 + t2) { vgs = Vd * (1 - Math.exp(-t / tau)); vds = V; id = I * (t - t1) / t2; }
+    else if (t < t1 + t2 + t3) { vgs = VPL; vds = V * (1 - (t - t1 - t2) / t3); id = I; }
+    else { const tt = t - t1 - t2 - t3; vgs = Vd - (Vd - VPL) * Math.exp(-tt / tau); vds = 0.05; id = I; }
+    on.t.push(t * 1e9); on.vgs.push(vgs); on.vds.push(vds); on.id.push(id);
+  }
+  const Eon = 0.5 * V * I * (t2 + t3);
+
+  // ---------- TURN-OFF ----------
+  // Gate discharges from Vd toward 0 through Rg: down to plateau, plateau (Vds rises), then current falls.
+  const u1 = tau * Math.log(Vd / VPL);
+  const u2 = Qgd / (VPL / Rg);                                 // Vds rise time
+  const u3 = tau * Math.log(VPL / VTH);                        // current fall time
+  const w0 = 1 / Math.sqrt(L * COSS), fr = w0 / (2 * Math.PI);
+  // Overshoot: inductive kick L*dI/dt, limited by the LC characteristic impedance case.
+  const kick = Math.min(L * I / u3, I * Math.sqrt(L / COSS));
+  const decay = 2 * L / RDAMP;
+  const uEnd = u1 + u2 + u3 + Math.max(5 * decay, 3 / fr);
+  const off = { t: [], vgs: [], vds: [], id: [] };
+  let vpk = V;
+  for (let k = 0; k <= 1500; k++) {
+    const t = k / 1500 * uEnd; let vgs, vds, id;
+    if (t < u1) { vgs = Vd * Math.exp(-t / tau); vds = 0.05; id = I; }
+    else if (t < u1 + u2) { vgs = VPL; vds = V * (t - u1) / u2; id = I; }
+    else if (t < u1 + u2 + u3) { const tt = t - u1 - u2; vgs = VPL * Math.exp(-tt / tau); id = I * (1 - tt / u3); vds = V + kick * Math.min(1, tt / Math.min(u3, 1 / (4 * fr))); }
+    else { const tt = t - u1 - u2 - u3; vgs = VPL * Math.exp(-(tt + u3) / tau); id = 0; vds = V + kick * Math.exp(-tt / decay) * Math.cos(w0 * tt); }
+    vpk = Math.max(vpk, vds);
+    off.t.push(t * 1e9); off.vgs.push(vgs); off.vds.push(vds); off.id.push(id);
+  }
+  const Eoff = 0.5 * V * I * (u2 + u3);
+
+  const scaleI = V / Math.max(I, 1);   // draw current scaled onto the voltage axis
+  plot(document.getElementById("c_on"), {
+    height: 230, xlabel: "TURN-ON   time (ns)", ylabel: "V  (Id scaled)",
+    ymin: -1, ymax: Math.max(V, Vd) * 1.15,
+    bands: [{ x0: (t1) * 1e9, x1: (t1 + t2 + t3) * 1e9, color: "rgba(224,49,49,0.12)" }],
+    series: [
+      { x: on.t, y: on.vgs, color: "--c4", label: "Vgs" },
+      { x: on.t, y: on.vds, color: "--c3", label: "Vds" },
+      { x: on.t, y: on.id.map(v => v * scaleI), color: "--c1", label: "Id (scaled)" }]
+  });
+  plot(document.getElementById("c_off"), {
+    height: 230, xlabel: "TURN-OFF   time (ns)", ylabel: "V  (Id scaled)",
+    ymin: -1, ymax: Math.max(vpk, Vd) * 1.1,
+    bands: [{ x0: u1 * 1e9, x1: (u1 + u2 + u3) * 1e9, color: "rgba(224,49,49,0.12)" }],
+    hlines: [{ y: 60, color: "--bad", label: "60 V FET rating" }],
+    series: [
+      { x: off.t, y: off.vgs, color: "--c4", label: "Vgs" },
+      { x: off.t, y: off.vds, color: "--c3", label: "Vds" },
+      { x: off.t, y: off.id.map(v => v * scaleI), color: "--c1", label: "Id (scaled)" }]
+  });
+  const set = (id, txt, cls) => { const e = document.getElementById(id); e.textContent = txt; e.className = cls || ""; };
+  set("o_tpl", plOK ? eng(t3, "s") : "drive too low!", plOK ? "" : "bad");
+  set("o_eon", eng(Eon, "J"));
+  set("o_eoff", eng(Eoff, "J"));
+  set("o_psw", eng((Eon + Eoff) * f, "W"));
+  set("o_vpk", eng(vpk, "V"), vpk > 60 ? "bad" : vpk > 0.8 * 60 ? "" : "good");
+  set("o_fr", eng(fr, "Hz"));
+};
+redraw();
+</script>
+</body>
+</html>

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PWM into a Winding</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<main>
+<nav class="back"><a href="../README.md">← Learning index</a> · module <a href="../01_Electronics_Fundamentals.md">01</a></nav>
+<h1>PWM into a motor winding (R + L + back-EMF)</h1>
+<p class="lead">A half-bridge connects one end of the winding to either +Vbus or GND. The winding's
+inductance refuses sudden current changes, so the square voltage becomes a current with a small
+triangular ripple. Move the sliders and watch the ripple.</p>
+
+<div class="grid">
+  <div class="panel">
+    <div class="ctrl"><label>Bus voltage <span id="vbus_v"></span></label><input id="vbus" type="range" min="6" max="48" step="1" value="24"></div>
+    <div class="ctrl"><label>Duty cycle <span id="duty_v"></span></label><input id="duty" type="range" min="0" max="1" step="0.01" value="0.5"></div>
+    <div class="ctrl"><label>PWM frequency <span id="fpwm_v"></span></label><input id="fpwm" type="range" min="1" max="60" step="1" value="20"></div>
+    <div class="ctrl"><label>Winding resistance R <span id="r_v"></span></label><input id="r" type="range" min="0.05" max="1" step="0.01" value="0.2"></div>
+    <div class="ctrl"><label>Winding inductance L <span id="l_v"></span></label><input id="l" type="range" min="10" max="500" step="5" value="100"></div>
+    <div class="ctrl"><label>Back-EMF (motor speed) <span id="e_v"></span></label><input id="e" type="range" min="0" max="40" step="0.5" value="10"></div>
+    <p class="note">Try: drop frequency to 2 kHz (huge ripple, audible whine in a real motor).
+    Try: small L (10 µH) - ripple explodes; that's why low-inductance motors need high PWM frequency.
+    Try: duty so that D·Vbus = back-EMF - average current ≈ 0. Below that, current goes negative:
+    the motor is <b>generating</b> (regen).</p>
+  </div>
+  <div class="panel">
+    <canvas id="cv"></canvas>
+    <canvas id="ci" style="margin-top:8px"></canvas>
+    <div class="readout">
+      <div><small>Average current</small><b id="o_avg"></b></div>
+      <div><small>Ripple peak-peak</small><b id="o_rip"></b></div>
+      <div><small>Time constant τ = L/R</small><b id="o_tau"></b></div>
+      <div><small>PWM period</small><b id="o_per"></b></div>
+    </div>
+  </div>
+</div>
+</main>
+<script src="common.js"></script>
+<script>
+const g = {
+  vbus: bindSlider("vbus", v => v + " V", () => redraw()),
+  duty: bindSlider("duty", v => (v * 100).toFixed(0) + " %", () => redraw()),
+  f: bindSlider("fpwm", v => v + " kHz", () => redraw()),
+  r: bindSlider("r", v => v.toFixed(2) + " Ω", () => redraw()),
+  l: bindSlider("l", v => v + " µH", () => redraw()),
+  e: bindSlider("e", v => v + " V", () => redraw()),
+};
+window.redraw = function () {
+  const V = g.vbus(), D = g.duty(), f = g.f() * 1e3, R = g.r(), L = g.l() * 1e-6, E = g.e();
+  const T = 1 / f, periods = 4, n = 2000, dt = periods * T / n;
+  // Start at the analytic steady-state minimum so the plot is already settled.
+  const Iavg = (D * V - E) / R;
+  // Simulate a few periods first to settle, then record.
+  let i = Iavg;
+  const step = t => { const on = (t % T) < D * T; const v = on ? V : 0; i += dt * (v - E - R * i) / L; return v; };
+  for (let k = 0; k < n * 3; k++) step(k * dt);
+  const ts = [], vs = [], is = [];
+  let lo = Infinity, hi = -Infinity, sum = 0;
+  for (let k = 0; k < n; k++) {
+    const t = k * dt; const v = step(t);
+    ts.push(t * 1e6); vs.push(v); is.push(i);
+    lo = Math.min(lo, i); hi = Math.max(hi, i); sum += i;
+  }
+  plot(document.getElementById("cv"), {
+    height: 170, xlabel: "time (µs)", ylabel: "volts",
+    ymin: -2, ymax: Math.max(V, E) + 4,
+    series: [{ x: ts, y: vs, color: "--c3", label: "phase voltage (PWM)" },
+             { x: [ts[0], ts[ts.length - 1]], y: [E, E], color: "--c4", label: "back-EMF", dash: [6, 4] }]
+  });
+  plot(document.getElementById("ci"), {
+    height: 220, xlabel: "time (µs)", ylabel: "amps",
+    series: [{ x: ts, y: is, color: "--c1", label: "winding current" }],
+    hlines: [{ y: 0, color: "--muted" }]
+  });
+  document.getElementById("o_avg").textContent = eng(sum / n, "A");
+  document.getElementById("o_rip").textContent = eng(hi - lo, "A");
+  document.getElementById("o_tau").textContent = eng(L / R, "s");
+  document.getElementById("o_per").textContent = eng(T, "s");
+};
+redraw();
+</script>
+</body>
+</html>

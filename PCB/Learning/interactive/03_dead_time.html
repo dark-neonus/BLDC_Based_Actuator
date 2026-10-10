@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dead Time Demo</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<main>
+<nav class="back"><a href="../README.md">← Learning index</a> · module <a href="../03_MOSFETs_and_Half_Bridge.md">03</a></nav>
+<h1>Half-bridge timing: dead time, shoot-through, body diode</h1>
+<p class="lead">The MCU commands the high-side (HS) and low-side (LS) FETs. Real FETs need time to turn
+<i>off</i> (turn-off delay). If the other FET turns on before that - both conduct - <b>shoot-through</b>.
+Too much dead time - the motor current flows through a body diode, wasting power and distorting the voltage.</p>
+
+<div class="grid">
+  <div class="panel">
+    <div class="ctrl"><label>Programmed dead time <span id="dt_v"></span></label><input id="dt" type="range" min="0" max="1000" step="10" value="300"></div>
+    <div class="ctrl"><label>FET turn-off delay (real) <span id="toff_v"></span></label><input id="toff" type="range" min="20" max="600" step="10" value="150"></div>
+    <div class="ctrl"><label>Phase current (+ = out to motor) <span id="ip_v"></span></label><input id="ip" type="range" min="-20" max="20" step="1" value="10"></div>
+    <div class="ctrl"><label>Bus voltage <span id="vb_v"></span></label><input id="vb" type="range" min="12" max="48" step="1" value="24"></div>
+    <p class="note">Set dead time below the turn-off delay → red shoot-through zones appear.
+    Flip the current sign → watch which body diode conducts and how the switch-node voltage during dead time changes
+    (that's the "dead-time distortion" FOC firmware compensates). Shown: a 4 µs window (one short PWM pulse).</p>
+  </div>
+  <div class="panel">
+    <canvas id="c"></canvas>
+    <div class="readout">
+      <div><small>Shoot-through time per period</small><b id="o_st"></b></div>
+      <div><small>Body-diode conduction per period</small><b id="o_bd"></b></div>
+      <div><small>Diode loss @ 20 kHz (Vf 0.9 V)</small><b id="o_pl"></b></div>
+      <div><small>Avg. voltage error vs ideal</small><b id="o_ve"></b></div>
+    </div>
+  </div>
+</div>
+</main>
+<script src="common.js"></script>
+<script>
+const g = {
+  dt: bindSlider("dt", v => v + " ns", () => redraw()),
+  toff: bindSlider("toff", v => v + " ns", () => redraw()),
+  ip: bindSlider("ip", v => v + " A", () => redraw()),
+  vb: bindSlider("vb", v => v + " V", () => redraw()),
+};
+window.redraw = function () {
+  const DT = g.dt(), TOFF = g.toff(), I = g.ip(), VB = g.vb(), TON = 40, VF = 0.9;
+  const W = 4000, HS_ON = 1000, HS_OFF = 3000;        // ideal HS pulse from 1 µs to 3 µs
+  // Commands (ns): LS turns off at HS_ON - DT... we place dead time before each HS on, after each HS off.
+  const cmdHS = t => t >= HS_ON && t < HS_OFF;
+  const cmdLS = t => t < HS_ON - DT || t >= HS_OFF + DT;
+  // Real conduction: on after TON delay, off after TOFF delay.
+  // A FET conducts if it has been commanded on for at least TON,
+  // or if it was commanded off less than TOFF ago (it is still turning off).
+  const lag = (cmd, t) => (cmd(t) && cmd(t - TON)) || (!cmd(t) && cmd(t - TOFF));
+  const N = 2000, ts = [], hsC = [], lsC = [], hsR = [], lsR = [], vsw = [], bands = [];
+  let st = 0, bd = 0, verr = 0, inST = null, inBD = null;
+  for (let k = 0; k <= N; k++) {
+    const t = k / N * W;
+    const h = lag(cmdHS, t), l = lag(cmdLS, t);
+    let v;
+    if (h && l) { v = VB / 2; st += W / N; }
+    else if (h) v = VB;
+    else if (l) v = 0;
+    else { v = I > 0 ? -VF : VB + VF; bd += W / N; }   // body diode decides
+    const ideal = (t >= HS_ON && t < HS_OFF) ? VB : 0;
+    verr += (v - ideal) * W / N;
+    ts.push(t); hsC.push(cmdHS(t) ? 1 : 0); lsC.push(cmdLS(t) ? 1 : 0);
+    hsR.push(h ? 1 : 0); lsR.push(l ? 1 : 0); vsw.push(v);
+    const s = h && l;
+    if (s && inST === null) inST = t; if (!s && inST !== null) { bands.push({ x0: inST, x1: t, color: "rgba(224,49,49,0.30)" }); inST = null; }
+    const d = !h && !l;
+    if (d && inBD === null) inBD = t; if (!d && inBD !== null) { bands.push({ x0: inBD, x1: t, color: "rgba(232,164,0,0.22)" }); inBD = null; }
+  }
+  // Stack digital traces above the analog switch-node voltage.
+  const off = VB + 6, sc = 4;
+  const lift = (arr, o) => arr.map(v => v * sc + o);
+  plot(document.getElementById("c"), {
+    height: 420, xlabel: "time (ns)   red = shoot-through, amber = body diode conducting", ylabel: "",
+    xmin: 0, xmax: W, ymin: -3, ymax: off + 4 * (sc + 2) + 3, bands,
+    series: [
+      { x: ts, y: lift(hsC, off + 3 * (sc + 2)), color: "--c3", label: "HS command", width: 1.5, dash: [4, 3] },
+      { x: ts, y: lift(hsR, off + 2 * (sc + 2)), color: "--c3", label: "HS real", width: 2 },
+      { x: ts, y: lift(lsC, off + 1 * (sc + 2)), color: "--c2", label: "LS command", width: 1.5, dash: [4, 3] },
+      { x: ts, y: lift(lsR, off), color: "--c2", label: "LS real", width: 2 },
+      { x: ts, y: vsw, color: "--c1", label: "switch node V", width: 2 }]
+  });
+  const per = 50000; // 20 kHz period in ns; this window contains one on+off pair of edges
+  const setv = (id, txt, cls) => { const e = document.getElementById(id); e.textContent = txt; e.className = cls || ""; };
+  setv("o_st", st > 0 ? eng(st * 1e-9, "s") + " ⚠" : "none", st > 0 ? "bad" : "good");
+  setv("o_bd", eng(bd * 1e-9, "s"));
+  setv("o_pl", eng(VF * Math.abs(I) * bd * 1e-9 / (per * 1e-9), "W"));
+  setv("o_ve", eng(verr * 1e-9 / (per * 1e-9), "V"));
+};
+redraw();
+</script>
+</body>
+</html>
